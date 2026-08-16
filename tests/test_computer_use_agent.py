@@ -7,9 +7,11 @@ from pathlib import Path
 from unittest import mock
 
 from computer_use_agent import (
+    ActionExecutor,
     ActionSafety,
     ActionValidator,
     BrowserTool,
+    CustomActionRegistry,
     JsonActionParser,
     ModelSelector,
     WorkingMemory,
@@ -224,6 +226,236 @@ class DesktopToolTests(unittest.TestCase):
         completed = subprocess.CompletedProcess(args=["/usr/bin/pbpaste"], returncode=0, stdout="copied", stderr="")
         with mock.patch("desktop_control.subprocess.run", return_value=completed):
             self.assertEqual(tool.get_clipboard(), "copied")
+
+
+class CustomActionRegistryTests(unittest.TestCase):
+    def test_define_persists_and_reloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "custom_actions.json"
+            registry = CustomActionRegistry(path)
+            registry.define(
+                name="check_port_open",
+                description="Check a TCP port",
+                kind="shell",
+                code="echo {host}:{port}",
+                args=["host", "port"],
+                required_args=["host", "port"],
+            )
+
+            reloaded = CustomActionRegistry(path)
+
+            action = reloaded.get("check_port_open")
+            self.assertIsNotNone(action)
+            self.assertEqual(action.kind, "shell")
+            self.assertEqual(action.required_args, ["host", "port"])
+
+    def test_define_rejects_builtin_name_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = CustomActionRegistry(Path(tmp) / "custom_actions.json")
+            with self.assertRaises(ValueError):
+                registry.define(name="shell", description="", kind="shell", code="echo hi", args=[], required_args=[])
+
+    def test_define_rejects_invalid_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = CustomActionRegistry(Path(tmp) / "custom_actions.json")
+            with self.assertRaises(ValueError):
+                registry.define(name="Bad-Name!", description="", kind="shell", code="echo hi", args=[], required_args=[])
+
+    def test_define_rejects_invalid_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = CustomActionRegistry(Path(tmp) / "custom_actions.json")
+            with self.assertRaises(ValueError):
+                registry.define(name="my_action", description="", kind="ruby", code="puts 1", args=[], required_args=[])
+
+    def test_remove_deletes_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = CustomActionRegistry(Path(tmp) / "custom_actions.json")
+            registry.define(name="my_action", description="", kind="shell", code="echo hi", args=[], required_args=[])
+            self.assertTrue(registry.remove("my_action"))
+            self.assertIsNone(registry.get("my_action"))
+            self.assertFalse(registry.remove("my_action"))
+
+
+class ActionValidatorCustomActionTests(unittest.TestCase):
+    def test_validate_allows_registered_custom_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = CustomActionRegistry(Path(tmp) / "custom_actions.json")
+            registry.define(
+                name="my_action", description="", kind="shell", code="echo {msg}", args=["msg"], required_args=["msg"]
+            )
+            valid, reason = ActionValidator.validate("my_action", {"msg": "hi"}, registry)
+            self.assertTrue(valid)
+            self.assertEqual(reason, "ok")
+
+    def test_validate_enforces_custom_required_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            registry = CustomActionRegistry(Path(tmp) / "custom_actions.json")
+            registry.define(
+                name="my_action", description="", kind="shell", code="echo {msg}", args=["msg"], required_args=["msg"]
+            )
+            valid, reason = ActionValidator.validate("my_action", {}, registry)
+            self.assertFalse(valid)
+            self.assertIn("requires arg: msg", reason)
+
+    def test_validate_rejects_unknown_action_without_registry(self) -> None:
+        valid, reason = ActionValidator.validate("my_action", {})
+        self.assertFalse(valid)
+        self.assertIn("Unsupported action", reason)
+
+
+class ActionExecutorCustomActionTests(unittest.TestCase):
+    def _executor(self, tmp: str) -> ActionExecutor:
+        root = Path(tmp)
+        registry = CustomActionRegistry(root / "custom_actions.json")
+        return ActionExecutor(root, "test-session", command_timeout=10, custom_actions=registry)
+
+    def test_define_action_via_execute_and_call_it_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = self._executor(tmp)
+            define_result = executor.execute(
+                "define_action",
+                {
+                    "name": "greet",
+                    "description": "Say hello",
+                    "kind": "shell",
+                    "code": "echo hello {name}",
+                    "args": ["name"],
+                    "required_args": ["name"],
+                },
+            )
+            self.assertEqual(define_result["status"], "ok")
+
+            call_result = executor.execute("greet", {"name": "world"})
+
+            self.assertEqual(call_result["status"], "ok")
+            self.assertIn("hello world", call_result["result"])
+
+    def test_shell_kind_quotes_args(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = self._executor(tmp)
+            executor.custom_actions.define(
+                name="echo_it", description="", kind="shell", code="echo {text}", args=["text"], required_args=["text"]
+            )
+
+            result = executor.execute("echo_it", {"text": "a b; rm -rf /tmp/should-not-run"})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertIn("a b; rm -rf /tmp/should-not-run", result["result"])
+
+    def test_python_kind_sets_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = self._executor(tmp)
+            executor.custom_actions.define(
+                name="add_numbers",
+                description="",
+                kind="python",
+                code="result = str(int(args['a']) + int(args['b']))",
+                args=["a", "b"],
+                required_args=["a", "b"],
+            )
+
+            result = executor.execute("add_numbers", {"a": "2", "b": "3"})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["result"], "5")
+
+    def test_python_kind_can_compose_run_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = self._executor(tmp)
+            (Path(tmp) / "notes.txt").write_text("hello", encoding="utf-8")
+            executor.custom_actions.define(
+                name="read_notes",
+                description="",
+                kind="python",
+                code="result = run_action('read_file', path='notes.txt')['result']",
+                args=[],
+                required_args=[],
+            )
+
+            result = executor.execute("read_notes", {})
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["result"], "hello")
+
+    def test_python_kind_missing_result_is_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = self._executor(tmp)
+            executor.custom_actions.define(
+                name="broken", description="", kind="python", code="x = 1", args=[], required_args=[]
+            )
+
+            result = executor.execute("broken", {})
+
+            self.assertEqual(result["status"], "error")
+
+    def test_missing_required_arg_is_error_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = self._executor(tmp)
+            executor.custom_actions.define(
+                name="needs_arg", description="", kind="shell", code="echo {x}", args=["x"], required_args=["x"]
+            )
+
+            result = executor.execute("needs_arg", {})
+
+            self.assertEqual(result["status"], "error")
+
+    def test_list_and_remove_custom_actions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            executor = self._executor(tmp)
+            executor.custom_actions.define(
+                name="temp_action", description="", kind="shell", code="echo hi", args=[], required_args=[]
+            )
+
+            listed = executor.execute("list_custom_actions", {})
+            self.assertIn("temp_action", listed["result"])
+
+            removed = executor.execute("remove_custom_action", {"name": "temp_action"})
+            self.assertEqual(removed["status"], "ok")
+            self.assertIsNone(executor.custom_actions.get("temp_action"))
+
+
+class ComputerUseAgentSelfCorrectionTests(unittest.TestCase):
+    def test_default_max_steps_is_unlimited(self) -> None:
+        from computer_use_agent import DEFAULT_MAX_STEPS
+
+        self.assertEqual(DEFAULT_MAX_STEPS, 0)
+
+    def test_run_self_corrects_after_repeated_shell_failures(self) -> None:
+        from computer_use_agent import ComputerUseAgent
+
+        with tempfile.TemporaryDirectory() as tmp:
+            agent = ComputerUseAgent(
+                task="test task",
+                workspace_root=Path(tmp),
+                model_path=Path(tmp) / "model.gguf",
+                port=0,
+                keep_server=True,
+                max_steps=0,
+                max_tokens=100,
+                command_timeout=5,
+                session_name="self-correction-test",
+                ctx_size=2048,
+                threads=1,
+                temperature=0.0,
+                reasoning_budget=0,
+            )
+            agent.llama_server.ensure_running = mock.MagicMock()
+            agent.llama_server.stop = mock.MagicMock()
+            # Three identical failing steps trigger the stall/repeated-signature warning,
+            # which should make run() proactively ask for a corrected action (4th chat
+            # call) instead of retrying the same failing shell command forever.
+            responses = [
+                '{"action":"shell","args":{"command":"false"},"message":"try1"}',
+                '{"action":"shell","args":{"command":"false"},"message":"try2"}',
+                '{"action":"shell","args":{"command":"false"},"message":"try3"}',
+                '{"action":"finish","args":{"message":"giving up"},"message":"done"}',
+            ]
+            agent.llama_server.chat = mock.MagicMock(side_effect=responses)
+
+            final_message = agent.run()
+
+            self.assertEqual(final_message, "giving up")
+            self.assertEqual(agent.llama_server.chat.call_count, 4)
 
 
 if __name__ == "__main__":

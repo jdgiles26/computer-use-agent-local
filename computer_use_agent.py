@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import signal
@@ -13,7 +14,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -27,14 +28,18 @@ PLAYWRIGHT_OUTPUT_DIR = OUTPUT_DIR / "playwright"
 LOG_DIR = OUTPUT_DIR / "logs"
 DESKTOP_OUTPUT_DIR = OUTPUT_DIR / "desktop"
 SCRIPTS_DIR = ROOT / "scripts"
+CUSTOM_ACTIONS_PATH = ROOT / "custom_actions.json"
 DEFAULT_PORT = 8012
 DEFAULT_REVIEWER_PORT = 8013
-DEFAULT_MAX_STEPS = 12
+# 0 means unlimited: the agent runs until it calls `finish` (or a self-correction
+# loop gives up). Pass --max-steps with a positive value to cap it again.
+DEFAULT_MAX_STEPS = 0
 DEFAULT_TIMEOUT = 30
 DEFAULT_CTX_SIZE = 8192
 MAX_OBSERVATION_CHARS = 8000
 MAX_FILE_READ_CHARS = 12000
 SERVER_READY_TIMEOUT = 180
+CUSTOM_ACTION_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 
 
 def ensure_dirs() -> None:
@@ -438,13 +443,140 @@ class ActionSafety:
 
     def check_shell(self, command: str) -> tuple[bool, str]:
         """Validate shell commands.
-        
+
         All shell commands are allowed including sudo, rm, chmod, etc.
         The user is responsible for the commands they request.
         """
         if not command or not command.strip():
             return False, "Empty command"
         return True, "ok"
+
+
+@dataclass
+class CustomAction:
+    """A model-defined action, backed by a shell template or a Python snippet."""
+
+    name: str
+    description: str
+    kind: str  # "shell" or "python"
+    code: str
+    args: list[str] = field(default_factory=list)
+    required_args: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "kind": self.kind,
+            "code": self.code,
+            "args": self.args,
+            "required_args": self.required_args,
+        }
+
+
+class CustomActionRegistry:
+    """Actions the model invented at runtime, persisted to disk for reuse across steps and runs.
+
+    This is what makes the agent's action set non-hardcoded: `ActionValidator` and
+    `ActionExecutor` treat every name in here exactly like a built-in action once it
+    has been defined via the `define_action` action.
+    """
+
+    VALID_KINDS = ("shell", "python")
+
+    def __init__(self, path: Path = CUSTOM_ACTIONS_PATH) -> None:
+        self.path = path
+        self.actions: dict[str, CustomAction] = {}
+        self.load()
+
+    def load(self) -> None:
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        for entry in data.get("actions", []) if isinstance(data, dict) else []:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                name = str(entry["name"])
+                code = str(entry["code"])
+                kind = str(entry.get("kind", "python"))
+            except KeyError:
+                continue
+            args = entry.get("args", [])
+            required = entry.get("required_args", [])
+            self.actions[name] = CustomAction(
+                name=name,
+                description=str(entry.get("description", "")),
+                kind=kind,
+                code=code,
+                args=[str(item) for item in args] if isinstance(args, list) else [],
+                required_args=[str(item) for item in required] if isinstance(required, list) else [],
+            )
+
+    def save(self) -> None:
+        payload = {"actions": [action.to_dict() for action in sorted(self.actions.values(), key=lambda a: a.name)]}
+        self.path.write_text(json_dumps(payload), encoding="utf-8")
+
+    def get(self, name: str) -> CustomAction | None:
+        return self.actions.get(name)
+
+    def names(self) -> set[str]:
+        return set(self.actions.keys())
+
+    def list_summary(self) -> str:
+        if not self.actions:
+            return "No custom actions defined yet."
+        lines = []
+        for action in sorted(self.actions.values(), key=lambda a: a.name):
+            required = f" required={action.required_args}" if action.required_args else ""
+            lines.append(f"- {action.name} [{action.kind}]{required}: {action.description or '(no description)'}")
+        return "\n".join(lines)
+
+    def define(
+        self,
+        *,
+        name: str,
+        description: str,
+        kind: str,
+        code: str,
+        args: list[str],
+        required_args: list[str],
+    ) -> CustomAction:
+        name = name.strip().lower()
+        kind = kind.strip().lower()
+        if not CUSTOM_ACTION_NAME_RE.match(name):
+            raise ValueError(
+                "Custom action name must be lowercase letters, digits, and underscores, "
+                "start with a letter, and be 2-64 chars"
+            )
+        if name in ActionValidator.SUPPORTED_ACTIONS:
+            raise ValueError(f"'{name}' is already a built-in action name")
+        if kind not in self.VALID_KINDS:
+            raise ValueError(f"Custom action kind must be one of {self.VALID_KINDS}")
+        if not code.strip():
+            raise ValueError("Custom action code must not be empty")
+        action = CustomAction(
+            name=name,
+            description=description.strip(),
+            kind=kind,
+            code=code,
+            args=[str(item) for item in args],
+            required_args=[str(item) for item in required_args],
+        )
+        self.actions[name] = action
+        self.save()
+        return action
+
+    def remove(self, name: str) -> bool:
+        name = name.strip().lower()
+        if name not in self.actions:
+            return False
+        del self.actions[name]
+        self.save()
+        return True
 
 
 class ActionValidator:
@@ -549,6 +681,9 @@ class ActionValidator:
         "devtools_extract_api_endpoints": (),
         "devtools_find_secrets": (),
         "devtools_analyze_source_map": ("source_map_url",),
+        # Custom actions (model-defined, persisted across runs)
+        "define_action": ("name", "kind", "code"),
+        "remove_custom_action": ("name",),
     }
     SUPPORTED_ACTIONS = {
         "finish",
@@ -556,6 +691,10 @@ class ActionValidator:
         "read_file",
         "write_file",
         "shell",
+        # Custom actions
+        "define_action",
+        "list_custom_actions",
+        "remove_custom_action",
         # Browser automation
         "browser_open",
         "browser_snapshot",
@@ -678,14 +817,21 @@ class ActionValidator:
     }
 
     @classmethod
-    def validate(cls, action: str, args: dict[str, Any]) -> tuple[bool, str]:
+    def validate(
+        cls,
+        action: str,
+        args: dict[str, Any],
+        custom_registry: "CustomActionRegistry | None" = None,
+    ) -> tuple[bool, str]:
         if not action:
             return False, "Action is empty"
-        if action not in cls.SUPPORTED_ACTIONS:
+        custom = custom_registry.get(action) if custom_registry is not None else None
+        if action not in cls.SUPPORTED_ACTIONS and custom is None:
             return False, f"Unsupported action: {action}"
         if not isinstance(args, dict):
             return False, "args must be a JSON object"
-        for key in cls.REQUIRED_ARGS.get(action, ()):
+        required = custom.required_args if custom is not None else cls.REQUIRED_ARGS.get(action, ())
+        for key in required:
             value = args.get(key)
             if value is None:
                 return False, f"Action {action} requires arg: {key}"
@@ -1390,12 +1536,19 @@ class BrowserTool:
 
 
 class ActionExecutor:
-    def __init__(self, workspace_root: Path, session_name: str, command_timeout: int) -> None:
+    def __init__(
+        self,
+        workspace_root: Path,
+        session_name: str,
+        command_timeout: int,
+        custom_actions: CustomActionRegistry | None = None,
+    ) -> None:
         self.workspace_root = workspace_root.resolve()
         self.safety = ActionSafety(self.workspace_root)
         self.browser = BrowserTool(session_name, root_dir=self.workspace_root)
         self.desktop = DesktopTool(self.workspace_root, OUTPUT_DIR)
         self.command_timeout = command_timeout
+        self.custom_actions = custom_actions if custom_actions is not None else CustomActionRegistry()
 
     def execute(self, action: str, args: dict[str, Any]) -> dict[str, Any]:
         try:
@@ -1575,6 +1728,16 @@ class ActionExecutor:
                     str(args.get("url", "")),
                     int(args.get("max_depth", 2)),
                 )}
+            # Custom actions: defined at runtime by the model, persisted for reuse.
+            if action == "define_action":
+                return {"status": "ok", "result": self.define_custom_action(args)}
+            if action == "list_custom_actions":
+                return {"status": "ok", "result": self.custom_actions.list_summary()}
+            if action == "remove_custom_action":
+                return {"status": "ok", "result": self.remove_custom_action(str(args.get("name", "")))}
+            custom = self.custom_actions.get(action)
+            if custom is not None:
+                return {"status": "ok", "result": self.run_custom_action(custom, args)}
         except Exception as exc:
             return {"status": "error", "result": str(exc)}
         return {"status": "error", "result": f"Unknown action: {action}"}
@@ -2208,8 +2371,91 @@ class ActionExecutor:
                             
             except Exception as e:
                 found.append(f"[ERROR] {current_url}: {str(e)[:50]}")
-        
+
         return "Crawl Results:\n" + "\n".join(found[:50])
+
+    def define_custom_action(self, args: dict[str, Any]) -> str:
+        """Register a new action from a shell template or Python snippet, persisted for reuse.
+
+        This is the mechanism that keeps the agent from being limited to a fixed,
+        hardcoded action catalog: once defined, the action is validated and executed
+        exactly like a built-in for the rest of this run and every future run.
+        """
+        name = str(args.get("name", ""))
+        description = str(args.get("description", ""))
+        kind = str(args.get("kind", "python"))
+        code = str(args.get("code", ""))
+        arg_names = args.get("args", [])
+        required = args.get("required_args", [])
+        if not isinstance(arg_names, list):
+            arg_names = []
+        if not isinstance(required, list):
+            required = []
+        action = self.custom_actions.define(
+            name=name,
+            description=description,
+            kind=kind,
+            code=code,
+            args=[str(item) for item in arg_names],
+            required_args=[str(item) for item in required],
+        )
+        return (
+            f"Defined custom action '{action.name}' [{action.kind}], saved to "
+            f"{self.custom_actions.path.name}. Call it directly by name from now on."
+        )
+
+    def remove_custom_action(self, name: str) -> str:
+        if not name.strip():
+            raise RuntimeError("remove_custom_action requires a name")
+        removed = self.custom_actions.remove(name)
+        if not removed:
+            raise RuntimeError(f"No custom action named '{name}'")
+        return f"Removed custom action '{name}'"
+
+    def run_custom_action(self, action: CustomAction, args: dict[str, Any]) -> str:
+        missing = [key for key in action.required_args if not str(args.get(key, "")).strip()]
+        if missing:
+            raise RuntimeError(f"Custom action {action.name} missing required args: {', '.join(missing)}")
+        if action.kind == "shell":
+            return self._run_custom_shell(action, args)
+        if action.kind == "python":
+            return self._run_custom_python(action, args)
+        raise RuntimeError(f"Unsupported custom action kind: {action.kind}")
+
+    def _run_custom_shell(self, action: CustomAction, args: dict[str, Any]) -> str:
+        try:
+            command = action.code.format(**{key: shlex.quote(str(value)) for key, value in args.items()})
+        except (KeyError, IndexError) as exc:
+            raise RuntimeError(f"Custom action {action.name} template placeholder error: {exc}") from exc
+        proc = run_command(["bash", "-lc", command], cwd=self.workspace_root, timeout=self.command_timeout)
+        output = "\n".join(part.strip() for part in (proc.stdout, proc.stderr) if part and part.strip())
+        if proc.returncode != 0:
+            raise RuntimeError(f"exit={proc.returncode}\n{truncate_text(output)}")
+        return truncate_text(output or "[no output]")
+
+    def _run_custom_python(self, action: CustomAction, args: dict[str, Any]) -> str:
+        namespace: dict[str, Any] = {
+            "args": dict(args),
+            "workspace_root": self.workspace_root,
+            "result": None,
+            "run_action": lambda name, **kwargs: self.execute(name, kwargs),
+            "shell": lambda cmd, timeout=self.command_timeout: run_command(
+                ["bash", "-lc", cmd], cwd=self.workspace_root, timeout=timeout
+            ),
+            "json": json,
+            "re": re,
+            "os": os,
+            "Path": Path,
+            "subprocess": subprocess,
+        }
+        try:
+            exec(compile(action.code, f"<custom_action:{action.name}>", "exec"), namespace)  # noqa: S102
+        except Exception as exc:
+            raise RuntimeError(f"Custom action {action.name} raised: {exc}") from exc
+        result = namespace.get("result")
+        if result is None:
+            raise RuntimeError(f"Custom action {action.name} did not set a 'result' string")
+        return truncate_text(str(result))
 
 
 class JsonActionParser:
@@ -2286,6 +2532,31 @@ Core Actions:
 - read_file: {"path": "relative/path.txt"}
 - write_file: {"path": "relative/path.txt", "content": "text", "append": false}
 - shell: {"command": "pwd"}
+
+Custom Actions (you are NOT limited to the actions listed in this prompt):
+- define_action: create a brand-new named action backed by a shell template or a Python
+  snippet. It is validated, saved to disk, and immediately callable by name for the rest
+  of this run and every future run -- use this instead of hardcoding a fixed action set.
+  {"name": "check_port_open", "description": "Check whether a TCP port is open on a host",
+   "kind": "shell", "code": "nc -z -w2 {host} {port} && echo open || echo closed",
+   "args": ["host", "port"], "required_args": ["host", "port"]}
+  For kind "python", `code` is a Python snippet executed with these names in scope:
+  `args` (dict of the args passed when the action is called), `workspace_root` (Path),
+  `run_action(name, **kwargs)` (call any other action, built-in or custom, and get back
+  its {"status", "result"} dict -- use this to compose existing actions), `shell(cmd)`
+  (run a shell command and get a CompletedProcess), plus `os`, `re`, `json`, `Path`,
+  `subprocess`. The snippet MUST assign a string to a variable named `result`.
+  {"name": "login_and_snapshot", "description": "Open a URL, fill login form, snapshot",
+   "kind": "python", "args": ["url", "user", "password"], "required_args": ["url"],
+   "code": "run_action('browser_open', url=args['url'])\nresult = run_action('browser_snapshot')['result']"}
+- list_custom_actions: {} -- list every custom action defined so far (name, kind, args).
+- remove_custom_action: {"name": "check_port_open"} -- delete a broken/obsolete custom action.
+- Rule: when a task needs a capability with no matching built-in or custom action, define
+  it once with define_action, then call it by name. If a multi-step sequence (e.g. login
+  flow, a specific scan, a repeated data-extraction routine) will likely be needed again,
+  save it as a custom action rather than repeating the raw steps every time.
+- Never redefine a custom action that already exists and already does the job -- call it
+  directly. Check "Custom actions available" in the task context before defining a new one.
 
 Browser Actions:
 - browser_open: {"url": "https://example.com", "headed": true}
@@ -2510,7 +2781,24 @@ Operating Principles:
    - You will execute any task the user explicitly asks for
    - No artificial restrictions on capabilities
 
-10. OUTPUT FORMAT:
+10. EXTENDING YOUR OWN CAPABILITIES:
+   - You are not limited to the actions listed above. If the task needs something no
+     built-in or previously-defined custom action covers, call define_action to create it.
+   - Prefer composing existing actions (via run_action inside a python custom action) over
+     duplicating logic that already exists.
+   - Reuse custom actions already listed under "Custom actions available" instead of
+     redefining them.
+
+11. RUNNING TO COMPLETION:
+   - There is no fixed step limit by default -- keep working until the task is actually
+     done, then call finish. Don't stop early just because many steps have passed.
+   - If working memory shows a pattern or stall warning, that means your current approach
+     is not working: change strategy (different action, different tool, narrower scope,
+     or define a custom action) rather than repeating the same call.
+   - If the task is genuinely impossible or the target is unreachable after real attempts,
+     call finish and explain why, instead of looping forever.
+
+12. OUTPUT FORMAT:
    - The action field must never be empty
    - No markdown, no code fences, no commentary outside the JSON object
    - If the task is complete, call finish with a summary
@@ -2529,6 +2817,12 @@ Example 4:
 
 Example 5:
 {"action":"finish","args":{"message":"Task completed"},"message":"Task completed"}
+
+Example 6 (defining a reusable custom action):
+{"action":"define_action","args":{"name":"check_port_open","description":"Check whether a TCP port is open","kind":"shell","code":"nc -z -w2 {host} {port} && echo open || echo closed","args":["host","port"],"required_args":["host","port"]},"message":"No built-in action checks a single port; defining one for reuse"}
+
+Example 7 (calling a previously-defined custom action by name):
+{"action":"check_port_open","args":{"host":"192.168.1.1","port":"22"},"message":"Reusing the custom action instead of redefining it"}
 """
     REVIEWER_PROMPT = """You review a proposed next action from another local model.
 You must respond with exactly one JSON object and nothing else.
@@ -2544,13 +2838,15 @@ Return the same action schema:
 Rules:
 - Approve the proposal unchanged when it is already the best next step.
 - Replace the proposal only when it is invalid, unsafe, or clearly weaker than a better immediate action.
+- The action does not have to be one of a fixed built-in list: define_action, list_custom_actions, and any already-defined custom action name (see "Custom actions available" in the context) are all valid.
 - Never invent browser refs. If the browser needs refs, prefer browser_snapshot over blind typing.
 - Never suggest workspace file reads to hunt for browser refs after browser_snapshot; the snapshot action already returns the latest snapshot path and key refs.
 - If recent shell observations show timeout or repeated failure, prefer a narrower next step over another near-identical retry.
 - Keep the action to a single next step.
 - The action field must never be empty.
 """
-    REPAIR_PROMPT = """You repair invalid or malformed agent tool actions.
+    REPAIR_PROMPT = """You repair invalid or malformed agent tool actions, and unstick an agent that is
+failing or stalling on repeated attempts of the same action.
 You must respond with exactly one JSON object and nothing else.
 
 Return the same action schema:
@@ -2563,7 +2859,12 @@ Return the same action schema:
 Rules:
 - Fix the action so it is valid and immediately useful for the task.
 - Prefer the smallest correction that preserves the user's goal.
-- If the original action is beyond repair, choose a better next action.
+- If the problem is a stall or repeated-failure warning rather than malformed JSON, do not
+  propose the same or a near-identical action again -- change strategy: a different tool,
+  a narrower target, gathering a diagnostic first (e.g. browser_snapshot, list_files,
+  system_info), defining a custom action via define_action if a needed capability is
+  missing, or finishing with the best partial result if the task is genuinely stuck.
+- The action does not have to be one of a fixed built-in list: define_action, list_custom_actions, and any already-defined custom action name (see "Custom actions available" in the context) are all valid.
 - Never invent browser refs.
 - Never return an empty action.
 """
@@ -2622,12 +2923,21 @@ Rules:
         self.working_memory = WorkingMemory()
         self.reviewer_model_path = reviewer_model_path
 
+    def custom_actions_context_lines(self) -> list[str]:
+        if not self.executor.custom_actions.actions:
+            return []
+        return [
+            "Custom actions available (call directly by name instead of redefining them):",
+            self.executor.custom_actions.list_summary(),
+        ]
+
     def build_messages(self) -> list[dict[str, str]]:
         progress_lines = [
             f"Workspace root: {self.workspace_root}",
             f"Current task: {self.task}",
             "Return the next best action as JSON.",
         ]
+        progress_lines.extend(self.custom_actions_context_lines())
         working_memory_lines = self.working_memory.summary_lines()
         if working_memory_lines:
             progress_lines.append("Working memory:")
@@ -2655,6 +2965,7 @@ Rules:
             f"Problem to fix: {problem}",
             "Return one corrected action JSON object.",
         ]
+        repair_lines.extend(self.custom_actions_context_lines())
         if candidate is not None:
             repair_lines.append(f"Candidate action: {json.dumps(candidate, ensure_ascii=True)}")
         if raw_response.strip():
@@ -2678,7 +2989,7 @@ Rules:
         args = repaired.get("args", {})
         if not isinstance(args, dict):
             args = {}
-        ok, reason = ActionValidator.validate(action, args)
+        ok, reason = ActionValidator.validate(action, args, self.executor.custom_actions)
         if not ok:
             self.history.append(f"Step {step}: repair_validation_error -> {reason}")
             return None
@@ -2694,6 +3005,7 @@ Rules:
             f"Primary proposal: {json.dumps(action_blob, ensure_ascii=True)}",
             "Return the single best next action as JSON.",
         ]
+        review_lines.extend(self.custom_actions_context_lines())
         if self.history:
             review_lines.append("Recent observations:")
             review_lines.extend(self.history[-8:])
@@ -2720,30 +3032,38 @@ Rules:
         if self.reviewer_server is not None:
             self.reviewer_server.ensure_running()
         final_message = ""
+        pending_override: dict[str, Any] | None = None
         try:
-            for step in range(1, self.max_steps + 1):
-                messages = self.build_messages()
-                raw = self.llama_server.chat(messages, max_tokens=self.max_tokens)
-                try:
-                    action_blob = JsonActionParser.extract_json(raw)
-                except ValueError as exc:
-                    error_message = str(exc)
-                    print_stderr(f"[step {step}] invalid-json: {truncate_text(raw, 1200)}")
-                    repaired = self.repair_action(step, f"Parser error: {error_message}", raw_response=raw)
-                    if repaired is None:
-                        self.history.append(f"Step {step}: parser_error -> {truncate_text(error_message, 2000)}")
-                        continue
-                    action_blob = repaired
+            step = 0
+            while self.max_steps <= 0 or step < self.max_steps:
+                step += 1
 
-                if self.reviewer_server is not None:
-                    reviewed = self.review_action(step, action_blob)
-                    if reviewed != action_blob:
-                        self.history.append(
-                            "Reviewer override: "
-                            f"{json.dumps(action_blob, ensure_ascii=True)} -> "
-                            f"{json.dumps(reviewed, ensure_ascii=True)}"
-                        )
-                        action_blob = reviewed
+                if pending_override is not None:
+                    action_blob = pending_override
+                    pending_override = None
+                else:
+                    messages = self.build_messages()
+                    raw = self.llama_server.chat(messages, max_tokens=self.max_tokens)
+                    try:
+                        action_blob = JsonActionParser.extract_json(raw)
+                    except ValueError as exc:
+                        error_message = str(exc)
+                        print_stderr(f"[step {step}] invalid-json: {truncate_text(raw, 1200)}")
+                        repaired = self.repair_action(step, f"Parser error: {error_message}", raw_response=raw)
+                        if repaired is None:
+                            self.history.append(f"Step {step}: parser_error -> {truncate_text(error_message, 2000)}")
+                            continue
+                        action_blob = repaired
+
+                    if self.reviewer_server is not None:
+                        reviewed = self.review_action(step, action_blob)
+                        if reviewed != action_blob:
+                            self.history.append(
+                                "Reviewer override: "
+                                f"{json.dumps(action_blob, ensure_ascii=True)} -> "
+                                f"{json.dumps(reviewed, ensure_ascii=True)}"
+                            )
+                            action_blob = reviewed
 
                 action = str(action_blob.get("action", "")).strip()
                 args = action_blob.get("args", {})
@@ -2751,7 +3071,7 @@ Rules:
                     args = {}
                 reason = str(action_blob.get("message", "")).strip()
 
-                valid, validation_message = ActionValidator.validate(action, args)
+                valid, validation_message = ActionValidator.validate(action, args, self.executor.custom_actions)
                 if not valid:
                     repaired = self.repair_action(
                         step,
@@ -2785,6 +3105,19 @@ Rules:
                 if status == "finished":
                     final_message = body
                     break
+
+                if status == "error":
+                    recent = self.working_memory.records[-6:]
+                    warning = self.working_memory.stall_warning(recent) or self.working_memory.repeated_signature_warning(recent)
+                    if warning:
+                        print_stderr(f"[step {step}] self-correcting: {warning}")
+                        correction = self.repair_action(
+                            step,
+                            f"{warning} Change strategy for the next action instead of repeating the failing one, "
+                            "or finish with the best partial result if the task cannot proceed.",
+                        )
+                        if correction is not None:
+                            pending_override = correction
         finally:
             if not self.keep_server:
                 self.llama_server.stop()
@@ -2803,7 +3136,12 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     parser.add_argument("--ctx-size", type=int, default=DEFAULT_CTX_SIZE, help="Context size for llama-server.")
     parser.add_argument("--threads", type=int, default=max(os.cpu_count() or 4, 4))
     parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=DEFAULT_MAX_STEPS,
+        help="Max steps before giving up. 0 (default) means unlimited: run until `finish` is called.",
+    )
     parser.add_argument("--max-tokens", type=int, default=900)
     parser.add_argument("--command-timeout", type=int, default=DEFAULT_TIMEOUT)
     parser.add_argument("--session", default=f"agent-{int(time.time())}")
