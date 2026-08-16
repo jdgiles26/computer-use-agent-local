@@ -2,3 +2,4 @@ models/
 output/
 __pycache__/
 .DS_Store
+custom_actions.json

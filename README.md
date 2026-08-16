@@ -63,6 +63,40 @@ By default it auto-selects the strongest complete instruction-friendly model it 
 - [`desktop_control.py`](/Users/joshua.giles/computer-use-agent-local/desktop_control.py): native desktop control
 - [`tests/test_computer_use_agent.py`](/Users/joshua.giles/computer-use-agent-local/tests/test_computer_use_agent.py): regression tests
 - [`output/`](/Users/joshua.giles/computer-use-agent-local/output): logs and generated artifacts
+- `custom_actions.json` (gitignored, created on demand): actions the agent has defined for itself at runtime; see [Custom Actions](#custom-actions) below
+
+## Autonomy
+
+- By default the agent runs until it calls `finish` -- there is no step cap (`--max-steps 0`,
+  the default, means unlimited). Pass `--max-steps N` to cap it again.
+- When recent steps are failing or repeating without progress, the agent no longer just gets a
+  passive warning in its context: it proactively asks for a corrected next action (a different
+  tool, a narrower target, or `finish` with the best partial result) instead of retrying the
+  same failing action indefinitely.
+
+## Custom Actions
+
+The agent is not limited to the fixed action catalog below. It can call `define_action` at any
+time to register a new action of its own -- backed by either a shell command template or a
+Python snippet -- which is validated and then callable by name for the rest of the run **and**
+every future run (it's persisted to `custom_actions.json` at the repo root).
+
+```json
+{"action": "define_action", "args": {
+  "name": "check_port_open",
+  "description": "Check whether a TCP port is open on a host",
+  "kind": "shell",
+  "code": "nc -z -w2 {host} {port} && echo open || echo closed",
+  "args": ["host", "port"],
+  "required_args": ["host", "port"]
+}}
+```
+
+Once defined, `check_port_open` is called directly: `{"action": "check_port_open", "args": {"host": "192.168.1.1", "port": "22"}}`.
+
+Python-kind actions can compose existing actions (built-in or custom) via `run_action(name, **kwargs)`,
+and must set a `result` string variable. Manage the registry with `list_custom_actions` and
+`remove_custom_action`.
 
 ## Browser Setup
 
@@ -217,6 +251,11 @@ By default it auto-selects the strongest complete instruction-friendly model it 
 - `desktop_open_app` - Open applications
 - `desktop_open_settings_panel` - Open system settings
 - `desktop_wait` - Wait/pause
+
+### Custom Actions
+- `define_action` - Register a new shell- or Python-backed action, persisted for reuse
+- `list_custom_actions` - List actions the agent has defined for itself
+- `remove_custom_action` - Delete a custom action
 
 ### Task Control
 - `finish` - Complete the task

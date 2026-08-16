@@ -65,8 +65,21 @@ This agent has **unrestricted system access**:
 - **Network operations** - HTTP requests, DNS lookup, port scanning
 - **System information** - Full system and network info gathering
 
+## Custom Actions
+
+- The agent is not limited to the built-in action catalog. It can call `define_action` to
+  register a new action (backed by a shell command template or a Python snippet), which is
+  validated by `ActionValidator`/`CustomActionRegistry`, persisted to `custom_actions.json`
+  at the repo root, and immediately callable by name for the rest of the run and in future runs.
+- `custom_actions.json` is gitignored (local state, like `models/`/`output/`), not versioned.
+- By default `--max-steps` is unlimited (0): the agent runs until it calls `finish`. Working
+  memory's stall/repeated-signature warnings now actively trigger a self-correction repair
+  call (not just a passive prompt warning) instead of retrying a failing action forever.
+
 ## Editing Rules
 
 - Keep output artifacts under `output/`.
-- Prefer extending the explicit action set over adding unrestricted execution paths.
-- When adding new actions, follow the pattern in `ActionValidator` and `ActionExecutor`.
+- Prefer extending the explicit action set over adding unrestricted execution paths — for
+  a genuinely new capability, prefer the model registering it via `define_action` at runtime
+  over hardcoding another named action in `ActionValidator`/`ActionExecutor`.
+- When adding new built-in actions, follow the pattern in `ActionValidator` and `ActionExecutor`.

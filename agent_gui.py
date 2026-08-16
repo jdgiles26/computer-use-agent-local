@@ -32,7 +32,7 @@ class AgentGui:
         
         # Simple defaults - no need to configure
         self.model_var = tk.StringVar(value="auto")
-        self.steps_var = tk.StringVar(value="20")
+        self.steps_var = tk.StringVar(value="0")  # 0 = unlimited, run until the agent calls finish
         self.status_var = tk.StringVar(value="Ready")
         
         self._build_ui()
